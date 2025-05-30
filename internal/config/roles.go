@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -35,8 +34,7 @@ func (rc *RolesConfig) SetupRolesForGuild(guildID string) (verifiedRoleID, unver
 	if err != nil {
 		return "", "", fmt.Errorf("failed to setup unverified role: %w", err)
 	}
-
-	log.Printf("[SetupRolesForGuild] Roles setup completed: verifed=%s, unverified=%s", verifiedRoleID, unverifiedRoleID)
+	
 	return verifiedRoleID, unverifiedRoleID, nil
 }
 
