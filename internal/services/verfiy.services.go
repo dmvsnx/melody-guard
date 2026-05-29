@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/savanyv/melody-guard/internal/config"
 	"github.com/savanyv/melody-guard/internal/store"
 )
 
-// Service handles the business logic for user verification
 type Service interface {
 	VerifyUser(ctx context.Context, guildID, userID string) error
 	hasRole(guildID, userID, roleID string) (bool, error)
@@ -17,10 +20,15 @@ type Service interface {
 	CheckVerification(ctx context.Context, guildID, userID string) (bool, error)
 	GetOrSetupRoles(guildID string) (verifiedRoleID, unverifiedRoleID string, err error)
 	HandleUserLeave(ctx context.Context, guildID, userID string) error
+	StartCleanupJob(ctx context.Context, interval, maxAge time.Duration)
+	RecordJoinTime(ctx context.Context, guildID, userID string) error
+	RemoveJoinTime(ctx context.Context, guildID, userID string) error
 }
+
 type service struct {
 	repo       store.VerifyRepository
 	roleConfig *config.RolesConfig
+	cleanupMu  sync.Mutex
 }
 
 func NewService(repo store.VerifyRepository, roleConfig *config.RolesConfig) Service {
@@ -77,7 +85,6 @@ func (s *service) UnverifyUser(ctx context.Context, guildID, userID string) erro
 		return errors.New("user is not verified")
 	}
 
-	// Mark user as unverified in storage
 	err = s.repo.SetUnverified(ctx, guildID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to set user as unverified: %w", err)
@@ -100,11 +107,104 @@ func (s *service) GetOrSetupRoles(guildID string) (verifiedRoleID, unverifiedRol
 }
 
 func (s *service) HandleUserLeave(ctx context.Context, guildID, userID string) error {
-	// Remove the user's verification status for this guild
 	err := s.repo.RemoveUserFromGuild(ctx, guildID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to handle user leave: %w", err)
 	}
 
 	return nil
+}
+
+func (s *service) RecordJoinTime(ctx context.Context, guildID, userID string) error {
+	return s.repo.SetJoinTime(ctx, guildID, userID, time.Now())
+}
+
+func (s *service) RemoveJoinTime(ctx context.Context, guildID, userID string) error {
+	return s.repo.RemoveJoinTime(ctx, guildID, userID)
+}
+
+func (s *service) StartCleanupJob(ctx context.Context, interval, maxAge time.Duration) {
+	go func() {
+		log.Printf("🧹 Cleanup job started (interval=%s, maxAge=%s)", interval, maxAge)
+		s.cleanupUnverified(ctx, maxAge)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.cleanupUnverified(ctx, maxAge)
+			case <-ctx.Done():
+				log.Println("🧹 Cleanup job stopped")
+				return
+			}
+		}
+	}()
+}
+
+func (s *service) cleanupUnverified(ctx context.Context, maxAge time.Duration) {
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+
+	keys, err := s.repo.GetAllUnverifiedKeys(ctx)
+	if err != nil {
+		log.Printf("🧹 Cleanup: failed to scan keys: %v", err)
+		return
+	}
+
+	now := time.Now()
+	kicked := 0
+
+	for _, key := range keys {
+		parts := strings.SplitN(key, ":", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		guildID := parts[1]
+		userID := parts[3]
+
+		joinTime, err := s.repo.GetJoinTime(ctx, guildID, userID)
+		if err != nil || joinTime == nil {
+			continue
+		}
+
+		if now.Sub(*joinTime) <= maxAge {
+			continue
+		}
+
+		member, err := s.roleConfig.Session.GuildMember(guildID, userID)
+		if err != nil {
+			s.repo.RemoveUserFromGuild(ctx, guildID, userID)
+			s.repo.RemoveJoinTime(ctx, guildID, userID)
+			continue
+		}
+
+		_, unverifiedRoleID, _ := s.GetOrSetupRoles(guildID)
+
+		hasUnverified := false
+		for _, roleID := range member.Roles {
+			if roleID == unverifiedRoleID {
+				hasUnverified = true
+				break
+			}
+		}
+
+		if hasUnverified {
+			err := s.roleConfig.Session.GuildMemberDeleteWithReason(guildID, userID, "Auto-kicked: unverified for too long")
+			if err != nil {
+				log.Printf("🧹 Cleanup: failed to kick %s in guild %s: %v", userID, guildID, err)
+			} else {
+				log.Printf("🧹 Cleanup: kicked unverified user %s from guild %s", userID, guildID)
+				kicked++
+			}
+		}
+
+		s.repo.RemoveUserFromGuild(ctx, guildID, userID)
+		s.repo.RemoveJoinTime(ctx, guildID, userID)
+	}
+
+	if len(keys) > 0 {
+		log.Printf("🧹 Cleanup: scanned %d, kicked %d unverified users", len(keys), kicked)
+	}
 }

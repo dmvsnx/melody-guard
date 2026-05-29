@@ -9,7 +9,7 @@ func NewHandlerHelp() *HandlerHelp {
 }
 
 func (h *HandlerHelp) HandlerHelp(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if i.ApplicationCommandData().Name != "help" {
+	if i.Type != discordgo.InteractionApplicationCommand || i.ApplicationCommandData().Name != "help" {
 		return
 	}
 
@@ -21,14 +21,9 @@ func (h *HandlerHelp) HandlerHelp(s *discordgo.Session, i *discordgo.Interaction
 				Value:  "Show this help message",
 				Inline: false,
 			},
-			{
+		{
 				Name:   "🔹 /verify",
 				Value:  "Get verified to access all channels",
-				Inline: false,
-			},
-			{
-				Name:   "🔹 /play [query]",
-				Value:  "Play music from YouTube\nExample: `/play never gonna give you up`",
 				Inline: false,
 			},
 		},

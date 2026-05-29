@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/savanyv/melody-guard/internal/bot"
 	"github.com/savanyv/melody-guard/internal/config"
@@ -15,6 +16,10 @@ import (
 
 func main() {
 	cfg := config.LoadConfig()
+
+	if cfg.DiscordToken == "" {
+		log.Fatal("DISCORD_TOKEN is required")
+	}
 
 	rdb := store.NewRedisClient(cfg.RedisAddress, cfg.RedisPassword, cfg.RedisDB)
 	defer rdb.Close()
@@ -40,11 +45,23 @@ func main() {
 	}
 	defer discordBot.Stop()
 
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	defer cleanupCancel()
+
+	if cfg.CleanupEnabled {
+		verifyService.StartCleanupJob(
+			cleanupCtx,
+			time.Duration(cfg.CleanupIntervalMinutes)*time.Minute,
+			time.Duration(cfg.CleanupMaxAgeHours)*time.Hour,
+		)
+	}
+
 	log.Println("✅ MelodyGuard is now running. Press CTRL+C to exit.")
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 
+	cleanupCancel()
 	log.Println("🛑 Shutting down MelodyGuard.")
 }

@@ -19,18 +19,76 @@ func NewHandler(service services.Service) *Handler {
 }
 
 func (h *Handler) HandlerVerify(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if i.ApplicationCommandData().Name != "verify" {
+	if i.Type != discordgo.InteractionApplicationCommand || i.ApplicationCommandData().Name != "verify" {
 		return
 	}
 
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	verifiedRoleID, _, err := h.service.GetOrSetupRoles(i.GuildID)
+	if err != nil {
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ " + err.Error(),
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	hasVerified := false
+	for _, roleID := range i.Member.Roles {
+		if roleID == verifiedRoleID {
+			hasVerified = true
+			break
+		}
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "🔐 Verification",
+		Color:       0x5865F2,
+		Description: "Click the button below to get verified and access all channels.",
+	}
+	if hasVerified {
+		embed.Description = "✅ You are already verified!"
+	}
+
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							Label:    "Verify",
+							Style:    discordgo.SuccessButton,
+							CustomID: "verify_button",
+							Disabled: hasVerified,
+							Emoji: &discordgo.ComponentEmoji{
+								Name: "✅",
+							},
+						},
+					},
+				},
+			},
 			Flags: discordgo.MessageFlagsEphemeral,
 		},
 	})
 	if err != nil {
-		log.Printf("Failed to respond to interaction: %v", err)
+		log.Printf("Failed to respond to verify command: %v", err)
+	}
+}
+
+func (h *Handler) HandlerVerifyButton(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionMessageComponent || i.MessageComponentData().CustomID != "verify_button" {
+		return
+	}
+
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	})
+	if err != nil {
+		log.Printf("Failed to defer button interaction: %v", err)
 		return
 	}
 
@@ -38,78 +96,68 @@ func (h *Handler) HandlerVerify(s *discordgo.Session, i *discordgo.InteractionCr
 	guildID := i.GuildID
 	userID := i.Member.User.ID
 
-	go func() {
-		sendResponse := func(content string) {
-			_, err := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Content: content,
-				Flags: discordgo.MessageFlagsEphemeral,
+	verifiedRoleID, unverifiedRoleID, err := h.service.GetOrSetupRoles(guildID)
+	if err != nil {
+		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ " + err.Error(),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		})
+		return
+	}
+
+	for _, roleID := range i.Member.Roles {
+		if roleID == verifiedRoleID {
+			h.service.VerifyUser(ctx, guildID, userID)
+			_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+				Content: "✅ You are already verified!",
+				Flags:   discordgo.MessageFlagsEphemeral,
 			})
+			return
+		}
+	}
+
+	if err := h.service.VerifyUser(ctx, guildID, userID); err != nil {
+		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ " + err.Error(),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		})
+		return
+	}
+
+	if unverifiedRoleID != "" {
+		if err := s.GuildMemberRoleRemove(guildID, userID, unverifiedRoleID); err != nil {
+			log.Printf("Warning: failed to remove unverified role: %v", err)
+		}
+	}
+
+	if err := s.GuildMemberRoleAdd(guildID, userID, verifiedRoleID); err != nil {
+		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ Failed to add verified role: " + err.Error(),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		})
+		return
+	}
+
+	log.Printf("✅ Verified via button - Guild: %s, User: %s", guildID, userID)
+
+	h.service.RemoveJoinTime(ctx, guildID, userID)
+
+	if i.Interaction.Message != nil {
+		if i.Interaction.Message.Flags&discordgo.MessageFlagsEphemeral != 0 {
+			err := s.InteractionResponseDelete(i.Interaction)
 			if err != nil {
-				log.Printf("Failed to send followup message: %v", err)
+				log.Printf("Warning: failed to delete ephemeral verify message: %v", err)
+			}
+		} else {
+			err := s.ChannelMessageDelete(i.ChannelID, i.Interaction.Message.ID)
+			if err != nil {
+				log.Printf("Warning: failed to delete verify message: %v", err)
 			}
 		}
+	}
 
-		verifiedRoleID, unverifiedRoleID, err := h.service.GetOrSetupRoles(guildID)
-		if err != nil {
-			sendResponse("❌ Failed to setup roles: " + err.Error())
-			return
-		}
-
-		if err := h.service.VerifyUser(ctx, guildID, userID); err != nil {
-			sendResponse("❌ Verification failed: " + err.Error())
-			return
-		}
-
-		if unverifiedRoleID != "" {
-			if err := s.GuildMemberRoleRemove(guildID, userID, unverifiedRoleID); err != nil {
-				log.Printf("Warning: Failed to remove unverified role: %v", err)
-			}
-		}
-
-		if err := s.GuildMemberRoleAdd(guildID, userID, verifiedRoleID); err != nil {
-			sendResponse("❌ Failed to add verified role: " + err.Error())
-			return
-		}
-
-		log.Println("✅ Verified Successfully - Guild:", guildID, "User:", userID)
-		sendResponse("✅ Verification successful!!!")
-	}()
+	_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: "✅ You are now verified! Welcome to the server!",
+		Flags:   discordgo.MessageFlagsEphemeral,
+	})
 }
-
-// func (h *Handler) HandlerUnverify(s *discordgo.Session, i *discordgo.InteractionCreate) {
-// 	if i.ApplicationCommandData().Name != "unverify" {
-// 		return
-// 	}
-
-// 	ctx := context.Background()
-// 	guildID := i.GuildID
-// 	userID := i.Member.User.ID
-
-// 	verifiedRoleID, unverifiedRoleID, err := h.service.GetOrSetupRoles(guildID)
-// 	if err != nil {
-// 		h.respondError(s, i, "Failed to get verification roles: "+err.Error())
-// 		return
-// 	}
-
-// 	err = h.service.UnverifyUser(ctx, guildID, userID)
-// 	if err != nil {
-// 		h.respondSuccess(s, i, "Unverification failed: "+err.Error())
-// 		return
-// 	}
-
-// 	if verifiedRoleID != "" {
-// 		err = s.GuildMemberRoleRemove(guildID, userID, verifiedRoleID)
-// 		if err != nil {
-// 			log.Printf("Warning: Failed to remove verified role: %v", err)
-// 		}
-// 	}
-
-// 	if unverifiedRoleID != "" {
-// 		err = s.GuildMemberRoleAdd(guildID, userID, unverifiedRoleID)
-// 		if err != nil {
-// 			log.Printf("Warning: Failed to add unverified role: %v", err)
-// 		}
-// 	}
-
-// 	h.respondSuccess(s, i, "🔒 You have been unverified. Please verify again to access server features.")
-// }

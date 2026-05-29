@@ -1,6 +1,8 @@
 package bot
 
 import (
+	"context"
+	"fmt"
 	"log"
 
 	"github.com/bwmarrin/discordgo"
@@ -14,7 +16,6 @@ type Bot struct {
 	verifyHandler *verify.Handler
 	verifyService services.Service
 	helphandler *help.HandlerHelp
-	commands []*discordgo.ApplicationCommand
 }
 
 func NewBot(token string, verifyServices services.Service) (*Bot, error) {
@@ -27,36 +28,11 @@ func NewBot(token string, verifyServices services.Service) (*Bot, error) {
 		discordgo.IntentsGuildMembers |
 		discordgo.IntentsGuildMessages
 
-	commands := []*discordgo.ApplicationCommand{
-		{
-			Name: "help",
-			Description: "Show this help message",
-		},
-		{
-			Name: "verify",
-			Description: "Verify yourself",
-		},
-		{
-			Name: "play",
-			Description: "Play a song",
-			Options: []*discordgo.ApplicationCommandOption{
-				{
-					Type: discordgo.ApplicationCommandOptionString,
-					Name: "query",
-					Description: "Song name or url",
-					Required: true,
-				},
-			},
-		},
-	}
-
 	return &Bot{
 		session: session,
 		verifyHandler: verify.NewHandler(verifyServices),
 		helphandler: help.NewHandlerHelp(),
 		verifyService: verifyServices,
-		commands: commands,
-
 	}, nil
 }
 
@@ -65,9 +41,9 @@ func (b *Bot) Start() error {
 	b.session.AddHandler(b.handlerMemberJoin)
 	b.session.AddHandler(b.handlerGuildCreate)
 	b.session.AddHandler(b.verifyHandler.HandlerVerify)
+	b.session.AddHandler(b.verifyHandler.HandlerVerifyButton)
 	b.session.AddHandler(b.helphandler.HandlerHelp)
 	b.session.AddHandler(b.handlerGuildMemberRemove)
-	// b.session.AddHandler(b.verifyHandler.HandlerUnverify)
 
 	err := b.session.Open()
 	if err != nil {
@@ -121,10 +97,65 @@ func (b *Bot) handlerMemberJoin(s *discordgo.Session, m *discordgo.GuildMemberAd
 	}
 
 	log.Printf("🔐 Assigned unverified role to new member %s", m.User.Username)
+
+	if err := b.verifyService.UnverifyUser(context.Background(), guildID, userID); err != nil {
+		log.Printf("Warning: failed to reset verification state: %v", err)
+	}
+
+	if err := b.verifyService.RecordJoinTime(context.Background(), guildID, userID); err != nil {
+		log.Printf("Warning: failed to record join time: %v", err)
+	}
+
+	guild, err := s.Guild(guildID)
+	if err != nil {
+		log.Printf("Failed to fetch guild info: %v", err)
+		return
+	}
+
+	if guild.SystemChannelID == "" {
+		return
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "👋 Welcome!",
+		Description: fmt.Sprintf("Welcome %s! Click the button below to get verified and access all channels.", m.Member.Mention()),
+		Color:       0x5865F2,
+		Thumbnail: &discordgo.MessageEmbedThumbnail{
+			URL: m.User.AvatarURL(""),
+		},
+	}
+
+	_, err = s.ChannelMessageSendComplex(guild.SystemChannelID, &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{embed},
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "Verify",
+						Style:    discordgo.SuccessButton,
+						CustomID: "verify_button",
+						Emoji: &discordgo.ComponentEmoji{
+							Name: "✅",
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to send welcome message: %v", err)
+	}
 }
 
 func (b *Bot) handlerGuildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
 	log.Printf("👋 User left: %s from guild %s", m.User.Username, m.GuildID)
+
+	if err := b.verifyService.HandleUserLeave(context.Background(), m.GuildID, m.User.ID); err != nil {
+		log.Printf("Warning: failed to cleanup data for leaving user: %v", err)
+	}
+	if err := b.verifyService.RemoveJoinTime(context.Background(), m.GuildID, m.User.ID); err != nil {
+		log.Printf("Warning: failed to remove join time for leaving user: %v", err)
+	}
 }
 
 func (b *Bot) registerCommands() {
@@ -136,18 +167,6 @@ func (b *Bot) registerCommands() {
 		{
 			Name: "verify",
 			Description: "Get verified to access all channels",
-		},
-		{
-			Name: "play",
-			Description: "Play a song",
-			Options: []*discordgo.ApplicationCommandOption{
-				{
-					Type: discordgo.ApplicationCommandOptionString,
-					Name: "query",
-					Description: "Song name or url",
-					Required: true,
-				},
-			},
 		},
 	}
 
