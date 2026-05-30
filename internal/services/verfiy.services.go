@@ -198,6 +198,7 @@ func (s *service) cleanupUnverified(ctx context.Context, maxAge time.Duration) {
 				log.Printf("🧹 Cleanup: kicked unverified user %s from guild %s", userID, guildID)
 				kicked++
 			}
+			time.Sleep(200 * time.Millisecond)
 		}
 
 		s.repo.RemoveUserFromGuild(ctx, guildID, userID)

@@ -42,6 +42,7 @@ func (b *Bot) Start() error {
 	b.session.AddHandler(b.handlerGuildCreate)
 	b.session.AddHandler(b.verifyHandler.HandlerVerify)
 	b.session.AddHandler(b.verifyHandler.HandlerVerifyButton)
+	b.session.AddHandler(b.verifyHandler.HandlerVerifyModal)
 	b.session.AddHandler(b.helphandler.HandlerHelp)
 	b.session.AddHandler(b.handlerGuildMemberRemove)
 

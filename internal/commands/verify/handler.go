@@ -71,7 +71,6 @@ func (h *Handler) HandlerVerify(s *discordgo.Session, i *discordgo.InteractionCr
 					},
 				},
 			},
-			Flags: discordgo.MessageFlagsEphemeral,
 		},
 	})
 	if err != nil {
@@ -84,11 +83,111 @@ func (h *Handler) HandlerVerifyButton(s *discordgo.Session, i *discordgo.Interac
 		return
 	}
 
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	verifiedRoleID, _, err := h.service.GetOrSetupRoles(i.GuildID)
+	if err != nil {
+		if _, ferr := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: strPtr("❌ " + err.Error()),
+		}); ferr != nil {
+			log.Printf("Failed to respond: %v", ferr)
+		}
+		return
+	}
+
+	for _, roleID := range i.Member.Roles {
+		if roleID == verifiedRoleID {
+			if _, ferr := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: strPtr("✅ You are already verified!"),
+			}); ferr != nil {
+				log.Printf("Failed to respond: %v", ferr)
+			}
+			return
+		}
+	}
+
+	msg := i.Interaction.Message
+	channelID := i.ChannelID
+
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseModal,
+		Data: &discordgo.InteractionResponseData{
+			CustomID: "verify_modal",
+			Title:    "📜 Accept Server Rules",
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "rules_accept",
+							Label:       "Type ACCEPT to verify you agree to the rules",
+							Style:       discordgo.TextInputShort,
+							Placeholder: "ACCEPT",
+							MinLength:   6,
+							MaxLength:   6,
+							Required:    true,
+						},
+					},
+				},
+			},
+		},
 	})
 	if err != nil {
-		log.Printf("Failed to defer button interaction: %v", err)
+		log.Printf("Failed to show modal: %v", err)
+		return
+	}
+
+	if msg != nil {
+		if err := s.ChannelMessageDelete(channelID, msg.ID); err != nil {
+			log.Printf("Warning: failed to delete verify message: %v", err)
+		}
+	}
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
+func (h *Handler) HandlerVerifyModal(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionModalSubmit || i.ModalSubmitData().CustomID != "verify_modal" {
+		return
+	}
+
+	data := i.ModalSubmitData()
+	acceptValue := ""
+	for _, row := range data.Components {
+		actionsRow, ok := row.(*discordgo.ActionsRow)
+		if !ok {
+			continue
+		}
+		for _, comp := range actionsRow.Components {
+			input, ok := comp.(*discordgo.TextInput)
+			if !ok || input.CustomID != "rules_accept" {
+				continue
+			}
+			acceptValue = input.Value
+		}
+	}
+
+	if acceptValue != "ACCEPT" {
+		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ You must type **ACCEPT** to verify. Please try again.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		if err != nil {
+			log.Printf("Failed to respond to modal: %v", err)
+		}
+		return
+	}
+
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Flags: discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to defer modal response: %v", err)
 		return
 	}
 
@@ -98,29 +197,34 @@ func (h *Handler) HandlerVerifyButton(s *discordgo.Session, i *discordgo.Interac
 
 	verifiedRoleID, unverifiedRoleID, err := h.service.GetOrSetupRoles(guildID)
 	if err != nil {
-		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		if _, ferr := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 			Content: "❌ " + err.Error(),
 			Flags:   discordgo.MessageFlagsEphemeral,
-		})
+		}); ferr != nil {
+			log.Printf("Failed to send followup: %v", ferr)
+		}
 		return
 	}
 
 	for _, roleID := range i.Member.Roles {
 		if roleID == verifiedRoleID {
-			h.service.VerifyUser(ctx, guildID, userID)
-			_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			if _, ferr := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 				Content: "✅ You are already verified!",
 				Flags:   discordgo.MessageFlagsEphemeral,
-			})
+			}); ferr != nil {
+				log.Printf("Failed to send followup: %v", ferr)
+			}
 			return
 		}
 	}
 
 	if err := h.service.VerifyUser(ctx, guildID, userID); err != nil {
-		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		if _, ferr := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 			Content: "❌ " + err.Error(),
 			Flags:   discordgo.MessageFlagsEphemeral,
-		})
+		}); ferr != nil {
+			log.Printf("Failed to send followup: %v", ferr)
+		}
 		return
 	}
 
@@ -131,33 +235,23 @@ func (h *Handler) HandlerVerifyButton(s *discordgo.Session, i *discordgo.Interac
 	}
 
 	if err := s.GuildMemberRoleAdd(guildID, userID, verifiedRoleID); err != nil {
-		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		if _, ferr := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 			Content: "❌ Failed to add verified role: " + err.Error(),
 			Flags:   discordgo.MessageFlagsEphemeral,
-		})
+		}); ferr != nil {
+			log.Printf("Failed to send followup: %v", ferr)
+		}
 		return
 	}
 
-	log.Printf("✅ Verified via button - Guild: %s, User: %s", guildID, userID)
+	log.Printf("✅ Verified via modal - Guild: %s, User: %s", guildID, userID)
 
 	h.service.RemoveJoinTime(ctx, guildID, userID)
 
-	if i.Interaction.Message != nil {
-		if i.Interaction.Message.Flags&discordgo.MessageFlagsEphemeral != 0 {
-			err := s.InteractionResponseDelete(i.Interaction)
-			if err != nil {
-				log.Printf("Warning: failed to delete ephemeral verify message: %v", err)
-			}
-		} else {
-			err := s.ChannelMessageDelete(i.ChannelID, i.Interaction.Message.ID)
-			if err != nil {
-				log.Printf("Warning: failed to delete verify message: %v", err)
-			}
-		}
-	}
-
-	_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+	if _, ferr := s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 		Content: "✅ You are now verified! Welcome to the server!",
 		Flags:   discordgo.MessageFlagsEphemeral,
-	})
+	}); ferr != nil {
+		log.Printf("Failed to send followup: %v", ferr)
+	}
 }
